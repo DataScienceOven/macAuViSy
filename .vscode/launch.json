@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:macAuViSy}",
+            "name": "Debug UnifiedControl",
+            "target": "UnifiedControl",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug UnifiedControl"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:macAuViSy}",
+            "name": "Release UnifiedControl",
+            "target": "UnifiedControl",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release UnifiedControl"
+        }
+    ]
+}

@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+*.swp
+
+# SwiftPM
+.build/
+Packages/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+
+# Application Bundle
+*.app/
+macAuViSy.app/
+
+# Build artifacts
+AppIcon.iconset/
+*.icns
+
+# Logs
+*.log
+*.app
+*.zip

@@ -1,0 +1,40 @@
+name: CI Build Check
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: Build & Verify App
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Icon Processing Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install opencv-python Pillow numpy
+
+    - name: Build Application Bundle
+      run: |
+        chmod +x build_install.sh
+        ./build_install.sh
+
+    - name: Create ZIP archive
+      run: zip -r macAuViSy.zip macAuViSy.app
+
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: macAuViSy-PR-Build
+        path: macAuViSy.zip
