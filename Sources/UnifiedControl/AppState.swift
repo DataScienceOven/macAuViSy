@@ -118,6 +118,7 @@ struct DisplayItem: Identifiable {
 
 struct AudioDeviceItem: Identifiable {
     let id: AudioDeviceID
+    var uid: String = ""
     var name: String
     var volume: Double // 0 to 100
     var hasHardwareDDC: Bool = false
@@ -186,6 +187,9 @@ class AppState: ObservableObject {
     private var runLoopSource: CFRunLoopSource?
     private var accessibilityTimer: Timer?
     private var globalMonitor: Any?
+    private var audioDevicesListenerBlock: AudioObjectPropertyListenerBlock?
+    private var defaultOutputListenerBlock: AudioObjectPropertyListenerBlock?
+    private var displayReconfigCallback: CGDisplayReconfigurationCallBack?
     @Published var isMuted: Bool = false
     private var preMuteVolume: Double = 50.0
     private var deviceVolumesBeforeMute: [AudioDeviceID: Double] = [:]
@@ -208,6 +212,51 @@ class AppState: ObservableObject {
         ) { [weak self] _ in
             self?.scheduleHardwareRefresh()
         }
+
+        // Display reconfiguration callback (instant hot-plug / unplug detection)
+        let dispCallback: CGDisplayReconfigurationCallBack = { (display, flags, userInfo) in
+            guard let userInfo = userInfo else { return }
+            let appState = Unmanaged<AppState>.fromOpaque(userInfo).takeUnretainedValue()
+            if flags.contains(.addFlag) || flags.contains(.removeFlag) || flags.contains(.enabledFlag) || flags.contains(.disabledFlag) {
+                appState.scheduleHardwareRefresh()
+            }
+        }
+        self.displayReconfigCallback = dispCallback
+        CGDisplayRegisterReconfigurationCallback(dispCallback, Unmanaged.passUnretained(self).toOpaque())
+
+        // CoreAudio hardware device change listener (audio interface plug/unplug)
+        var devicesAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let devBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.scheduleHardwareRefresh()
+        }
+        self.audioDevicesListenerBlock = devBlock
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &devicesAddress,
+            DispatchQueue.main,
+            devBlock
+        )
+
+        // CoreAudio default output change listener (active speaker switch)
+        var defaultOutputAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let outBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.scheduleHardwareRefresh()
+        }
+        self.defaultOutputListenerBlock = outBlock
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultOutputAddress,
+            DispatchQueue.main,
+            outBlock
+        )
         
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
@@ -215,6 +264,7 @@ class AppState: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             self?.tearDownEventTap()
+            self?.tearDownHardwareListeners()
             CGDisplayRestoreColorSyncSettings()
         }
         
@@ -230,7 +280,43 @@ class AppState: ObservableObject {
     
     deinit {
         tearDownEventTap()
+        tearDownHardwareListeners()
         CGDisplayRestoreColorSyncSettings()
+    }
+
+    private func tearDownHardwareListeners() {
+        if let dispCallback = displayReconfigCallback {
+            CGDisplayRemoveReconfigurationCallback(dispCallback, Unmanaged.passUnretained(self).toOpaque())
+            displayReconfigCallback = nil
+        }
+        if let devBlock = audioDevicesListenerBlock {
+            var devicesAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDevices,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &devicesAddress,
+                DispatchQueue.main,
+                devBlock
+            )
+            audioDevicesListenerBlock = nil
+        }
+        if let outBlock = defaultOutputListenerBlock {
+            var defaultOutputAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &defaultOutputAddress,
+                DispatchQueue.main,
+                outBlock
+            )
+            defaultOutputListenerBlock = nil
+        }
     }
     
     private func tearDownEventTap() {
@@ -668,6 +754,113 @@ class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Native Standalone Bypass
+    // When MacBook speakers are selected as active audio out AND no external monitors are connected,
+    // yield all hardware key controls completely to macOS native system.
+    func shouldBypassHardwareKeyIntercept() -> Bool {
+        // 1. Check if any external monitor is connected
+        let hasExternalMonitor: Bool
+        var displayCount: UInt32 = 0
+        var displayList = [CGDirectDisplayID](repeating: 0, count: 16)
+        let status = CGGetOnlineDisplayList(16, &displayList, &displayCount)
+        if status == .success && displayCount > 0 {
+            var foundExternal = false
+            for i in 0..<Int(displayCount) {
+                let id = displayList[i]
+                guard id != 0 else { continue }
+                if CGDisplayIsBuiltin(id) == 0 {
+                    foundExternal = true
+                    break
+                }
+            }
+            hasExternalMonitor = foundExternal
+        } else {
+            hasExternalMonitor = displays.contains(where: { !$0.isBuiltIn })
+        }
+        
+        // If an external monitor is connected, macAuViSy must handle hardware controls
+        if hasExternalMonitor {
+            return false
+        }
+        
+        // 2. Check if default audio output device is MacBook built-in speakers
+        return isDefaultAudioOutputMacBookSpeakers()
+    }
+    
+    private func isDefaultAudioOutputMacBookSpeakers() -> Bool {
+        var defaultOutputDeviceID: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &defaultOutputDeviceID
+        )
+        guard status == noErr, defaultOutputDeviceID != 0 else { return false }
+        
+        // Handle Aggregate / Multi-Output Devices
+        var subDevAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioAggregateDevicePropertyActiveSubDeviceList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        if AudioObjectHasProperty(defaultOutputDeviceID, &subDevAddress) {
+            var subDataSize: UInt32 = 0
+            AudioObjectGetPropertyDataSize(defaultOutputDeviceID, &subDevAddress, 0, nil, &subDataSize)
+            let subCount = Int(subDataSize) / MemoryLayout<AudioObjectID>.size
+            if subCount > 0 {
+                var subIDs = [AudioObjectID](repeating: 0, count: subCount)
+                AudioObjectGetPropertyData(defaultOutputDeviceID, &subDevAddress, 0, nil, &subDataSize, &subIDs)
+                for subID in subIDs {
+                    if !isDeviceBuiltInSpeaker(subID) {
+                        return false
+                    }
+                }
+                return true
+            }
+        }
+        
+        return isDeviceBuiltInSpeaker(defaultOutputDeviceID)
+    }
+    
+    private func isDeviceBuiltInSpeaker(_ deviceID: AudioDeviceID) -> Bool {
+        // Transport must be built-in: 'bltn' (1651274862)
+        var transAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var transport: UInt32 = 0
+        var tSize = UInt32(MemoryLayout<UInt32>.size)
+        AudioObjectGetPropertyData(deviceID, &transAddress, 0, nil, &tSize, &transport)
+        guard transport == 1651274862 /* 'bltn' */ else { return false }
+        
+        var nameAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceNameCFString,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceName: CFString = "" as CFString
+        var nameSize = UInt32(MemoryLayout<CFString>.size)
+        let status = withUnsafeMutablePointer(to: &deviceName) { ptr in
+            AudioObjectGetPropertyData(deviceID, &nameAddress, 0, nil, &nameSize, ptr)
+        }
+        guard status == noErr else { return false }
+        
+        let name = (deviceName as String).lowercased()
+        if name.contains("headphones") || name.contains("headset") || name.contains("earphones") {
+            return false
+        }
+        return name.contains("speaker") || name.contains("macbook") || name.contains("built-in") || name.contains("internal")
+    }
+
     private func setupEventTap() {
         // Start passive global monitor for volume keys routed through mediaremoted
         if globalMonitor == nil {
@@ -675,6 +868,7 @@ class AppState: ObservableObject {
                 guard let self = self else { return }
                 // If eventPort (CGEventTap) is active, CGEventTap handles all keys exclusively to prevent duplicates
                 guard self.eventPort == nil else { return }
+                guard !self.shouldBypassHardwareKeyIntercept() else { return }
                 
                 guard event.subtype.rawValue == 8 else { return }
                 let data = event.data1
@@ -748,6 +942,12 @@ class AppState: ObservableObject {
             if let refcon = refcon {
                 let appState = Unmanaged<AppState>.fromOpaque(refcon).takeUnretainedValue()
                 
+                // If MacBook built-in speakers are selected as active audio out AND no external monitors are connected,
+                // do not override anything! Pass the hardware key event untouched to macOS native handler.
+                if appState.shouldBypassHardwareKeyIntercept() {
+                    return Unmanaged.passRetained(event)
+                }
+                
                 // Only process key-down (0xA), NEVER key-up (0xB)
                 if keyType == 0xA {
                     let flags = event.flags
@@ -792,9 +992,12 @@ class AppState: ObservableObject {
         
         if status == .success {
             var newDisplays: [DisplayItem] = []
+            var seenIDs = Set<CGDirectDisplayID>()
             for i in 0..<Int(displayCount) {
                 let displayID = displayList[i]
                 guard displayID != 0 else { continue }
+                guard !seenIDs.contains(displayID) else { continue }
+                seenIDs.insert(displayID)
                 let isBuiltIn = CGDisplayIsBuiltin(displayID) != 0
                 
                 let displayName = getDisplayName(for: displayID, isBuiltIn: isBuiltIn)
@@ -918,8 +1121,22 @@ class AppState: ObservableObject {
         let getStatus = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize, &audioDeviceIDs)
         guard getStatus == noErr else { return }
         
+        let targetIDs = getTargetAudioDeviceIDs()
         var newAudioDevices: [AudioDeviceItem] = []
+        
         for id in audioDeviceIDs {
+            // 1. Strict Liveness Check: Discard disconnected/ghost/zombie endpoints
+            var isAlive: UInt32 = 0
+            var aliveSize = UInt32(MemoryLayout<UInt32>.size)
+            var aliveAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceIsAlive,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            let aliveStatus = AudioObjectGetPropertyData(id, &aliveAddress, 0, nil, &aliveSize, &isAlive)
+            guard aliveStatus == noErr, isAlive != 0 else { continue }
+            
+            // 2. Active Output Streams check
             var streamAddress = AudioObjectPropertyAddress(
                 mSelector: kAudioDevicePropertyStreams,
                 mScope: kAudioDevicePropertyScopeOutput,
@@ -927,8 +1144,9 @@ class AppState: ObservableObject {
             )
             var streamDataSize: UInt32 = 0
             AudioObjectGetPropertyDataSize(id, &streamAddress, 0, nil, &streamDataSize)
-            if streamDataSize == 0 { continue }
+            guard streamDataSize > 0 else { continue }
             
+            // 3. Device Name
             var nameAddress = AudioObjectPropertyAddress(
                 mSelector: kAudioDevicePropertyDeviceNameCFString,
                 mScope: kAudioObjectPropertyScopeGlobal,
@@ -941,8 +1159,23 @@ class AppState: ObservableObject {
             }
             guard status == noErr else { continue }
             
-            let name = (deviceName as String)
+            let name = (deviceName as String).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { continue }
             
+            // 4. Device UID for persistent hardware identity
+            var uidAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var uidCF: CFString = "" as CFString
+            var uidSize = UInt32(MemoryLayout<CFString>.size)
+            let uidStatus = withUnsafeMutablePointer(to: &uidCF) { ptr in
+                AudioObjectGetPropertyData(id, &uidAddress, 0, nil, &uidSize, ptr)
+            }
+            let uid = (uidStatus == noErr) ? (uidCF as String) : ""
+            
+            // 5. Filter Aggregate, Virtual, and Conferencing drivers
             var subDevAddress = AudioObjectPropertyAddress(
                 mSelector: kAudioAggregateDevicePropertyActiveSubDeviceList,
                 mScope: kAudioObjectPropertyScopeGlobal,
@@ -957,19 +1190,21 @@ class AppState: ObservableObject {
             var transportSize = UInt32(MemoryLayout<UInt32>.size)
             AudioObjectGetPropertyData(id, &transportAddress, 0, nil, &transportSize, &transportType)
             
+            let nameLower = name.lowercased()
             if AudioObjectHasProperty(id, &subDevAddress) || 
                transportType == 1735554416 /* grup */ || 
-               name.lowercased().contains("aggregate") || 
-               name.lowercased().contains("multi-output") { 
+               nameLower.contains("aggregate") || 
+               nameLower.contains("multi-output") { 
                 continue 
             }
             
             if transportType == 1986622068 /* virt */ ||
-               name.lowercased().contains("teams") ||
-               name.lowercased().contains("zoom") {
+               nameLower.contains("teams") ||
+               nameLower.contains("zoom") {
                 continue
             }
             
+            // 6. Direct Volume Acquisition from System CoreAudio
             var volAddress = AudioObjectPropertyAddress(
                 mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
                 mScope: kAudioDevicePropertyScopeOutput,
@@ -989,34 +1224,58 @@ class AppState: ObservableObject {
             let hasHardwareDDC = isDisplayTransport || matchesDDCDisplay
 
             if AudioObjectHasProperty(id, &volAddress) {
-                AudioObjectGetPropertyData(id, &volAddress, 0, nil, &volSize, &volume)
+                let status = AudioObjectGetPropertyData(id, &volAddress, 0, nil, &volSize, &volume)
+                if status != noErr {
+                    var ch1 = volAddress
+                    ch1.mElement = 1
+                    if AudioObjectHasProperty(id, &ch1) {
+                        _ = AudioObjectGetPropertyData(id, &ch1, 0, nil, &volSize, &volume)
+                    }
+                }
             } else if hasHardwareDDC {
                 if let ddcVol = DDCWorker.shared.getVolume(), ddcVol > 0 {
                     volume = Float32(ddcVol) / 100.0
                 } else if let saved = savedVol, saved > 0 {
                     volume = Float32(saved / 100.0)
-                } else if let existing = self.audioDevices.first(where: { $0.id == id && $0.volume > 0 }) {
-                    volume = Float32(existing.volume / 100.0)
                 } else {
                     volume = 0.5
                 }
             } else {
                 if let saved = savedVol, saved > 0 {
                     volume = Float32(saved / 100.0)
-                } else if let existing = self.audioDevices.first(where: { $0.id == id && $0.volume > 0 }) {
-                    volume = Float32(existing.volume / 100.0)
                 } else {
                     volume = 0.5
                 }
             }
             
-            newAudioDevices.append(AudioDeviceItem(id: id, name: name, volume: Double(volume * 100.0), hasHardwareDDC: hasHardwareDDC))
+            let isDefault = targetIDs.contains(id)
+            let deviceItem = AudioDeviceItem(
+                id: id,
+                uid: uid,
+                name: name,
+                volume: Double(volume * 100.0),
+                hasHardwareDDC: hasHardwareDDC
+            )
+
+            // 7. Strict Real-Time Deduplication:
+            // Sourced directly from live system without accumulating stale phantom sliders.
+            // If an endpoint with the same UID or same display name is already in the list,
+            // keep the canonical active/default one and do not duplicate.
+            if let existingIndex = newAudioDevices.firstIndex(where: {
+                (!uid.isEmpty && $0.uid == uid) || $0.name == name
+            }) {
+                if isDefault || (deviceItem.volume > 0 && newAudioDevices[existingIndex].volume <= 0) {
+                    newAudioDevices[existingIndex] = deviceItem
+                }
+                continue
+            }
+            
+            newAudioDevices.append(deviceItem)
         }
         
         DispatchQueue.main.async {
             self.isScanning = true
             self.audioDevices = newAudioDevices
-            let targetIDs = self.getTargetAudioDeviceIDs()
             if let defaultDev = newAudioDevices.first(where: { targetIDs.contains($0.id) }) {
                 self.combinedVolume = defaultDev.volume
             } else if let first = newAudioDevices.first {
