@@ -106,6 +106,98 @@ final class DDCWorker {
     }
 }
 
+// MARK: - Software Dimmer Manager (For Virtual / USB Displays)
+// Virtual display drivers (DisplayLink, MCT, InstantView, SiliconMotion) capture frames before
+// GPU hardware transfer tables and have no I2C DDC hardware connection.
+// A transparent, click-through black overlay window provides smooth software dimming down to 0%.
+final class SoftwareDimmerManager {
+    static let shared = SoftwareDimmerManager()
+    private var overlayWindows: [CGDirectDisplayID: NSWindow] = [:]
+    
+    func setBrightness(_ level: Double, for displayID: CGDirectDisplayID) {
+        let clamped = max(0.0, min(100.0, level))
+        let alpha = CGFloat(1.0 - (clamped / 100.0))
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            // At 100% brightness, no dimming overlay is needed
+            if alpha <= 0.001 {
+                if let window = self.overlayWindows[displayID] {
+                    window.orderOut(nil)
+                }
+                return
+            }
+            
+            // Find target NSScreen for this displayID
+            guard let screen = NSScreen.screens.first(where: {
+                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == displayID
+            }) else {
+                if let window = self.overlayWindows[displayID] {
+                    window.orderOut(nil)
+                    self.overlayWindows.removeValue(forKey: displayID)
+                }
+                return
+            }
+            
+            let window: NSWindow
+            if let existing = self.overlayWindows[displayID] {
+                window = existing
+                if window.frame != screen.frame {
+                    window.setFrame(screen.frame, display: true)
+                }
+            } else {
+                let win = NSWindow(
+                    contentRect: screen.frame,
+                    styleMask: [.borderless],
+                    backing: .buffered,
+                    defer: false,
+                    screen: screen
+                )
+                win.isOpaque = false
+                win.hasShadow = false
+                win.backgroundColor = .black
+                win.ignoresMouseEvents = true
+                // Sits directly above status bar & menu bar (level 26) so the entire display,
+                // including the top menu bar, dims down uniformly to complete black.
+                win.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.statusWindow)) + 1)
+                win.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+                self.overlayWindows[displayID] = win
+                window = win
+            }
+            
+            window.alphaValue = alpha
+            window.orderFrontRegardless()
+        }
+    }
+    
+    func updateFrames() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            for (displayID, window) in self.overlayWindows {
+                if let screen = NSScreen.screens.first(where: {
+                    ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == displayID
+                }) {
+                    window.setFrame(screen.frame, display: true)
+                } else {
+                    window.orderOut(nil)
+                    self.overlayWindows.removeValue(forKey: displayID)
+                }
+            }
+        }
+    }
+    
+    func cleanup() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            for (_, window) in self.overlayWindows {
+                window.orderOut(nil)
+            }
+            self.overlayWindows.removeAll()
+        }
+    }
+}
+
 // MARK: - Models
 struct DisplayItem: Identifiable {
     let id: CGDirectDisplayID
@@ -129,8 +221,8 @@ class AppState: ObservableObject {
     private var isScanning = false
     private var isUpdatingCombined = false
 
-    var displayOffsets: [CGDirectDisplayID: Double] = [:]
-    var audioOffsets: [AudioDeviceID: Double] = [:]
+    var displayRatios: [CGDirectDisplayID: Double] = [:]
+    var audioRatios: [AudioDeviceID: Double] = [:]
 
     @Published var displays: [DisplayItem] = []
     @Published var combinedBrightness: Double = 50.0 {
@@ -140,11 +232,9 @@ class AppState: ObservableObject {
             for i in 0..<displays.count {
                 if combinedBrightness <= 0.0 {
                     displays[i].brightness = 0.0
-                } else if combinedBrightness >= 100.0 {
-                    displays[i].brightness = 100.0
                 } else {
-                    let offset = displayOffsets[displays[i].id] ?? 0.0
-                    displays[i].brightness = max(0.0, min(100.0, combinedBrightness + offset))
+                    let ratio = displayRatios[displays[i].id] ?? 1.0
+                    displays[i].brightness = max(0.0, min(100.0, combinedBrightness * ratio))
                 }
                 setBrightness(for: displays[i], level: displays[i].brightness)
             }
@@ -163,11 +253,9 @@ class AppState: ObservableObject {
             for i in 0..<audioDevices.count {
                 if combinedVolume <= 0.0 {
                     audioDevices[i].volume = 0.0
-                } else if combinedVolume >= 100.0 {
-                    audioDevices[i].volume = 100.0
                 } else {
-                    let offset = audioOffsets[audioDevices[i].id] ?? 0.0
-                    audioDevices[i].volume = max(0.0, min(100.0, combinedVolume + offset))
+                    let ratio = audioRatios[audioDevices[i].id] ?? 1.0
+                    audioDevices[i].volume = max(0.0, min(100.0, combinedVolume * ratio))
                 }
             }
             isUpdatingCombined = false
@@ -265,6 +353,7 @@ class AppState: ObservableObject {
         ) { [weak self] _ in
             self?.tearDownEventTap()
             self?.tearDownHardwareListeners()
+            SoftwareDimmerManager.shared.cleanup()
             CGDisplayRestoreColorSyncSettings()
         }
         
@@ -281,6 +370,7 @@ class AppState: ObservableObject {
     deinit {
         tearDownEventTap()
         tearDownHardwareListeners()
+        SoftwareDimmerManager.shared.cleanup()
         CGDisplayRestoreColorSyncSettings()
     }
 
@@ -344,6 +434,7 @@ class AppState: ObservableObject {
     }
 
     func refreshHardware() {
+        SoftwareDimmerManager.shared.updateFrames()
         scanDisplays()
         scanAudioDevices()
     }
@@ -354,7 +445,8 @@ class AppState: ObservableObject {
             displays[idx].brightness = display.brightness
         }
         setBrightness(for: display, level: display.brightness)
-        displayOffsets[display.id] = display.brightness - combinedBrightness
+        let ref = max(1.0, combinedBrightness)
+        displayRatios[display.id] = display.brightness / ref
     }
     
     func syncVolume(for device: AudioDeviceItem) {
@@ -365,7 +457,18 @@ class AppState: ObservableObject {
             audioDevices[idx].volume = device.volume
         }
         setVolume(for: device, level: device.volume)
-        audioOffsets[device.id] = device.volume - combinedVolume
+        if combinedVolume <= 0.0 && device.volume > 0.0 {
+            isUpdatingCombined = true
+            combinedVolume = device.volume
+            isUpdatingCombined = false
+            for dev in audioDevices {
+                let r = max(1.0, combinedVolume)
+                audioRatios[dev.id] = dev.volume / r
+            }
+        } else {
+            let ref = max(1.0, combinedVolume)
+            audioRatios[device.id] = device.volume / ref
+        }
     }
     
     func syncAllDisplays(level: Double) {
@@ -454,6 +557,14 @@ class AppState: ObservableObject {
         var updated = display
         updated.brightness = clamped
         applyGammaAndLuminance(for: updated)
+        
+        // 4. Software Dimmer Overlay for Virtual / USB displays (DisplayLink, MCT, InstantView)
+        // Virtual display drivers bypass GPU transfer tables, so a click-through transparent black overlay
+        // provides smooth, real-time dimming from 100% down to 0% darkness.
+        if !display.isBuiltIn && !display.hasDDC {
+            SoftwareDimmerManager.shared.setBrightness(clamped, for: display.id)
+        }
+        
         UserDefaults.standard.set(clamped, forKey: "brightness_\(display.id)")
         UserDefaults.standard.set(clamped, forKey: "brightness_\(display.name)")
     }
@@ -554,11 +665,9 @@ class AppState: ObservableObject {
             for i in 0..<audioDevices.count {
                 if targetVol <= 0.0 {
                     audioDevices[i].volume = 0.0
-                } else if targetVol >= 100.0 {
-                    audioDevices[i].volume = 100.0
                 } else {
-                    let offset = audioOffsets[audioDevices[i].id] ?? 0.0
-                    audioDevices[i].volume = max(0.0, min(100.0, targetVol + offset))
+                    let ratio = audioRatios[audioDevices[i].id] ?? 1.0
+                    audioDevices[i].volume = max(0.0, min(100.0, targetVol * ratio))
                 }
             }
             isUpdatingCombined = false
@@ -577,11 +686,9 @@ class AppState: ObservableObject {
         for i in 0..<audioDevices.count {
             if targetVol <= 0.0 {
                 audioDevices[i].volume = 0.0
-            } else if targetVol >= 100.0 {
-                audioDevices[i].volume = 100.0
             } else {
-                let offset = audioOffsets[audioDevices[i].id] ?? 0.0
-                audioDevices[i].volume = max(0.0, min(100.0, targetVol + offset))
+                let ratio = audioRatios[audioDevices[i].id] ?? 1.0
+                audioDevices[i].volume = max(0.0, min(100.0, targetVol * ratio))
             }
         }
         isUpdatingCombined = false
@@ -605,9 +712,9 @@ class AppState: ObservableObject {
             combinedVolume = restoreVol
             for i in 0..<audioDevices.count {
                 let saved = deviceVolumesBeforeMute[audioDevices[i].id]
-                let offset = audioOffsets[audioDevices[i].id] ?? 0.0
-                let calculated = max(0.0, min(100.0, restoreVol + offset))
-                audioDevices[i].volume = (saved != nil && saved! > 5.0) ? saved! : calculated
+                let ratio = audioRatios[audioDevices[i].id] ?? 1.0
+                let calculated = max(0.0, min(100.0, restoreVol * ratio))
+                audioDevices[i].volume = (saved != nil && saved! > 0.0) ? saved! : calculated
             }
             isUpdatingCombined = false
             
@@ -621,9 +728,9 @@ class AppState: ObservableObject {
             combinedVolume = restoreVol
             for i in 0..<audioDevices.count {
                 let saved = deviceVolumesBeforeMute[audioDevices[i].id]
-                let offset = audioOffsets[audioDevices[i].id] ?? 0.0
-                let calculated = max(0.0, min(100.0, restoreVol + offset))
-                audioDevices[i].volume = (saved != nil && saved! > 5.0) ? saved! : calculated
+                let ratio = audioRatios[audioDevices[i].id] ?? 1.0
+                let calculated = max(0.0, min(100.0, restoreVol * ratio))
+                audioDevices[i].volume = (saved != nil && saved! > 0.0) ? saved! : calculated
             }
             isUpdatingCombined = false
             
@@ -668,11 +775,9 @@ class AppState: ObservableObject {
         for i in 0..<displays.count {
             if targetBrightness <= 0.0 {
                 displays[i].brightness = 0.0
-            } else if targetBrightness >= 100.0 {
-                displays[i].brightness = 100.0
             } else {
-                let offset = displayOffsets[displays[i].id] ?? 0.0
-                displays[i].brightness = max(0.0, min(100.0, targetBrightness + offset))
+                let ratio = displayRatios[displays[i].id] ?? 1.0
+                displays[i].brightness = max(0.0, min(100.0, targetBrightness * ratio))
             }
             setBrightness(for: displays[i], level: displays[i].brightness)
         }
@@ -1058,9 +1163,13 @@ class AppState: ObservableObject {
                 if let first = newDisplays.first {
                     self.combinedBrightness = first.brightness
                 }
+                let ref = max(1.0, self.combinedBrightness)
                 for display in newDisplays {
-                    self.displayOffsets[display.id] = display.brightness - self.combinedBrightness
+                    self.displayRatios[display.id] = display.brightness / ref
                     self.applyGammaAndLuminance(for: display)
+                    if !display.isBuiltIn && !display.hasDDC {
+                        SoftwareDimmerManager.shared.setBrightness(display.brightness, for: display.id)
+                    }
                 }
                 self.isScanning = false
             }
@@ -1281,8 +1390,9 @@ class AppState: ObservableObject {
             } else if let first = newAudioDevices.first {
                 self.combinedVolume = first.volume
             }
+            let ref = max(1.0, self.combinedVolume)
             for dev in newAudioDevices {
-                self.audioOffsets[dev.id] = dev.volume - self.combinedVolume
+                self.audioRatios[dev.id] = dev.volume / ref
             }
             self.isScanning = false
         }
