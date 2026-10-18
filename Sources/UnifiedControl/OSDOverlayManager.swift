@@ -244,7 +244,7 @@ final class OSDOverlayManager {
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = false
-        p.level = .floating
+        p.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)))
         p.ignoresMouseEvents = true
         p.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         
